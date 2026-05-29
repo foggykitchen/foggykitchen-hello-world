@@ -30,7 +30,7 @@ steps:
     name: "Build container image"
     command: |
       cd "${OCI_PRIMARY_SOURCE_DIR:-${OCI_WORKSPACE_DIR}/foggykitchen-hello-world}"
-      docker build --pull --rm -t foggykitchen-hello-world:latest .
+      podman build --pull --rm -t foggykitchen-hello-world:latest .
  
 outputArtifacts:
   - name: APPLICATION_DOCKER_IMAGE
