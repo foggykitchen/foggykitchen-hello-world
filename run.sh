@@ -1,3 +1,3 @@
 docker run -d -p 80:80 \
            --name fkhelloworld \
-                   foggykitchen-hello-world 
+           foggykitchen-hello-world:latest
