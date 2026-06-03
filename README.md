@@ -8,6 +8,8 @@ It is intentionally small and predictable. Its main purpose is to serve as:
 - a straightforward container workload for OKE deployment examples
 - a lightweight demo application for public FoggyKitchen patterns
 
+Support expectations are documented in [SUPPORT.md](SUPPORT.md).
+
 ---
 
 ## Purpose
