@@ -1,4 +1,4 @@
-FROM nginx:1.27-alpine
+FROM public.ecr.aws/docker/library/nginx:1.27-alpine
 
 # Copy the nginx configuration file to the container
 COPY ./config/nginx.conf /etc/nginx/nginx.conf
