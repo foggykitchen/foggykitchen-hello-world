@@ -33,9 +33,9 @@ It intentionally does **not** contain:
 
 Those concerns belong in companion repositories such as:
 
-- `helm-foggykitchen-hello-world`
-- `terraform-oci-fk-devops`
-- `terraform-oci-fk-devops-pipeline`
+- [helm-foggykitchen-hello-world](https://github.com/foggykitchen/helm-foggykitchen-hello-world)
+- [terraform-oci-fk-devops](https://github.com/foggykitchen/terraform-oci-fk-devops)
+- [terraform-oci-fk-devops-pipeline](https://github.com/foggykitchen/terraform-oci-fk-devops-pipeline)
 - [terraform-az-fk-devops-pipeline](https://github.com/foggykitchen/terraform-az-fk-devops-pipeline)
 
 ---
