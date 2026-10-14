@@ -1,0 +1,129 @@
+# Reference copy; runtime reads azure-pipelines-cicd.yml from foggykitchen-hello-world/master.
+trigger: none
+pr: none
+variables:
+  - group: fk-configuration
+  - name: imageName
+    value: foggykitchen-hello-world
+stages:
+  - stage: Build
+    displayName: Build, test and publish
+    jobs:
+      - job: Build
+        timeoutInMinutes: 15
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+    
+          - bash: |
+              set -euo pipefail
+              docker build --pull --rm -t "$IMAGE_NAME:$IMAGE_TAG" .
+            displayName: Build container image
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(Build.BuildId)
+    
+          - bash: |
+              set -euo pipefail
+              container_name="fk-hello-world-$IMAGE_TAG"
+              cleanup() {
+                status=$?
+                if [ "$status" -ne 0 ]; then
+                  docker logs "$container_name" || true
+                fi
+                docker rm -f "$container_name" >/dev/null 2>&1 || true
+              }
+              trap cleanup EXIT
+              docker run -d --name "$container_name" \
+                -p 127.0.0.1:8080:80 "$IMAGE_NAME:$IMAGE_TAG"
+              response_file=$(mktemp)
+              curl --fail --silent --show-error --retry 20 \
+                --retry-all-errors --retry-delay 1 --retry-max-time 30 --max-time 5 \
+                http://127.0.0.1:8080/ -o "$response_file"
+              cmp src/index.html "$response_file"
+              echo "Smoke test passed: NGINX serves the repository's index.html"
+            displayName: Smoke test container
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(Build.BuildId)
+          - task: AzureCLI@2
+            name: push
+            displayName: Push tested image to ACR using OIDC
+            inputs:
+              azureSubscription: fk-azure-oidc
+              scriptType: bash
+              scriptLocation: inlineScript
+              visibleAzLogin: false
+              inlineScript: |
+                set -euo pipefail
+                az acr login --name "$ACR_NAME" --only-show-errors
+                docker tag "$IMAGE_NAME:$IMAGE_TAG" "$ACR_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+                docker push "$ACR_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+                digest=$(az acr repository show --name "$ACR_NAME" --image "$IMAGE_NAME:$IMAGE_TAG" --query digest -o tsv)
+                [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+                image_reference="$ACR_SERVER/$IMAGE_NAME@$digest"
+                echo "##vso[task.setvariable variable=imageReference;isOutput=true]$image_reference"
+                mkdir -p "$ARTIFACT_DIR"
+                printf 'image=%s\ncommit=%s\nenvironment=%s\n' "$image_reference" "$SOURCE_VERSION" "$DEPLOY_ENVIRONMENT" > "$ARTIFACT_DIR/image-metadata.txt"
+            env:
+              ACR_NAME: $(acrName)
+              ACR_SERVER: $(acrLoginServer)
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(Build.BuildId)
+              SOURCE_VERSION: $(Build.SourceVersion)
+              DEPLOY_ENVIRONMENT: $(environment)
+              ARTIFACT_DIR: $(Build.ArtifactStagingDirectory)
+          - task: PublishPipelineArtifact@1
+            displayName: Publish immutable image metadata
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: IMAGE_METADATA
+              publishLocation: pipeline
+
+  - stage: Deploy
+    displayName: Deploy and verify application
+    dependsOn: Build
+    condition: succeeded()
+    variables:
+      imageReference: $[ stageDependencies.Build.Build.outputs['push.imageReference'] ]
+    jobs:
+      - job: Deploy
+        timeoutInMinutes: 15
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+          - task: AzureCLI@2
+            displayName: Deploy image digest and verify HTTPS using OIDC
+            inputs:
+              azureSubscription: fk-azure-oidc
+              scriptType: bash
+              scriptLocation: inlineScript
+              visibleAzLogin: false
+              inlineScript: |
+                set -euo pipefail
+                az containerapp update --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+                  --container-name hello --image "$IMAGE_REFERENCE" --only-show-errors --output none
+                actual_image=$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+                  --query 'properties.template.containers[0].image' -o tsv)
+                [[ "$actual_image" == "$IMAGE_REFERENCE" ]]
+                response_file=$(mktemp)
+                verified=false
+                for attempt in $(seq 1 36); do
+                  if curl --fail --silent --show-error --max-time 10 "$APPLICATION_URL/" -o "$response_file" \
+                    && cmp -s src/index.html "$response_file"; then
+                    verified=true
+                    break
+                  fi
+                  sleep 5
+                done
+                [[ "$verified" == true ]]
+                echo "Deployment verified: $APPLICATION_URL serves the tested application image $IMAGE_REFERENCE"
+            env:
+              APP_NAME: $(containerAppName)
+              RESOURCE_GROUP: $(resourceGroupName)
+              APPLICATION_URL: $(applicationUrl)
+              IMAGE_REFERENCE: $(imageReference)
