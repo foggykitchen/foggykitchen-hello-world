@@ -1,9 +1,67 @@
+# Reference copy; the pipeline reads this file from foggykitchen-hello-world/master.
 trigger: none
 pr: none
 
-pool:
-  vmImage: ubuntu-latest
+jobs:
+  - job: Build
+    displayName: Build and test the NGINX application
+    timeoutInMinutes: 15
+    pool:
+      vmImage: ubuntu-24.04
+    variables:
+      imageName: foggykitchen-hello-world
+    steps:
+      - checkout: self
+        persistCredentials: false
 
-steps:
-  - script: echo "Hello from Azure Pipelines"
-    displayName: Hello World
+      - bash: |
+          set -euo pipefail
+          docker build --pull --rm -t "$IMAGE_NAME:$IMAGE_TAG" .
+        displayName: Build container image
+        env:
+          IMAGE_NAME: $(imageName)
+          IMAGE_TAG: $(Build.BuildId)
+
+      - bash: |
+          set -euo pipefail
+          container_name="fk-hello-world-$IMAGE_TAG"
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container_name" || true
+            fi
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name "$container_name" \
+            -p 127.0.0.1:8080:80 "$IMAGE_NAME:$IMAGE_TAG"
+          response_file=$(mktemp)
+          curl --fail --silent --show-error --retry 20 \
+            --retry-connrefused --retry-delay 1 --max-time 10 \
+            http://127.0.0.1:8080/ -o "$response_file"
+          cmp src/index.html "$response_file"
+          echo "Smoke test passed: NGINX serves the repository's index.html"
+        displayName: Smoke test container
+        env:
+          IMAGE_NAME: $(imageName)
+          IMAGE_TAG: $(Build.BuildId)
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          docker save "$IMAGE_NAME:$IMAGE_TAG" | gzip > "$ARTIFACT_DIR/foggykitchen-hello-world.tar.gz"
+          printf 'image=%s:%s\ncommit=%s\n' "$IMAGE_NAME" "$IMAGE_TAG" "$SOURCE_VERSION" > "$ARTIFACT_DIR/image-metadata.txt"
+          (cd "$ARTIFACT_DIR" && sha256sum foggykitchen-hello-world.tar.gz > SHA256SUMS)
+        displayName: Export container image
+        env:
+          IMAGE_NAME: $(imageName)
+          IMAGE_TAG: $(Build.BuildId)
+          SOURCE_VERSION: $(Build.SourceVersion)
+          ARTIFACT_DIR: $(Build.ArtifactStagingDirectory)
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish APPLICATION_DOCKER_IMAGE
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)
+          artifact: APPLICATION_DOCKER_IMAGE
+          publishLocation: pipeline
