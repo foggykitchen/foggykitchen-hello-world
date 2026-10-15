@@ -1,0 +1,138 @@
+# Build requires private ACR connectivity; Deploy uses the ARM Run Command API.
+trigger: none
+pr: none
+variables:
+  - group: fk-configuration
+  - name: imageName
+    value: foggykitchen-hello-world
+stages:
+  - stage: Build
+    displayName: Build, test and publish
+    jobs:
+      - job: Build
+        timeoutInMinutes: 15
+        pool:
+          name: $(buildAgentPool)
+        steps:
+          - checkout: self
+            persistCredentials: false
+    
+          - bash: |
+              set -euo pipefail
+              docker build --pull --rm -t "$IMAGE_NAME:$IMAGE_TAG" .
+            displayName: Build container image
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(Build.BuildId)
+    
+          - bash: |
+              set -euo pipefail
+              container_name="fk-hello-world-$IMAGE_TAG"
+              cleanup() {
+                status=$?
+                if [ "$status" -ne 0 ]; then
+                  docker logs "$container_name" || true
+                fi
+                docker rm -f "$container_name" >/dev/null 2>&1 || true
+              }
+              trap cleanup EXIT
+              docker run -d --name "$container_name" \
+                -p 127.0.0.1:8080:80 "$IMAGE_NAME:$IMAGE_TAG"
+              response_file=$(mktemp)
+              curl --fail --silent --show-error --retry 20 \
+                --retry-all-errors --retry-delay 1 --retry-max-time 30 --max-time 5 \
+                http://127.0.0.1:8080/ -o "$response_file"
+              cmp src/index.html "$response_file"
+              echo "Smoke test passed: NGINX serves the repository's index.html"
+            displayName: Smoke test container
+            env:
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(Build.BuildId)
+          - task: AzureCLI@2
+            name: push
+            displayName: Push tested image to ACR using OIDC
+            inputs:
+              azureSubscription: fk-azure-oidc
+              scriptType: bash
+              scriptLocation: inlineScript
+              visibleAzLogin: false
+              inlineScript: |
+                set -euo pipefail
+                az acr login --name "$ACR_NAME" --only-show-errors
+                docker tag "$IMAGE_NAME:$IMAGE_TAG" "$ACR_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+                docker push "$ACR_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+                digest=$(az acr repository show --name "$ACR_NAME" --image "$IMAGE_NAME:$IMAGE_TAG" --query digest -o tsv)
+                [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+                image_reference="$ACR_SERVER/$IMAGE_NAME@$digest"
+                echo "##vso[task.setvariable variable=imageReference;isOutput=true]$image_reference"
+                mkdir -p "$ARTIFACT_DIR"
+                printf 'image=%s\ncommit=%s\nenvironment=%s\n' "$image_reference" "$SOURCE_VERSION" "$DEPLOY_ENVIRONMENT" > "$ARTIFACT_DIR/image-metadata.txt"
+            env:
+              ACR_NAME: $(acrName)
+              ACR_SERVER: $(acrLoginServer)
+              IMAGE_NAME: $(imageName)
+              IMAGE_TAG: $(Build.BuildId)
+              SOURCE_VERSION: $(Build.SourceVersion)
+              DEPLOY_ENVIRONMENT: $(environment)
+              ARTIFACT_DIR: $(Build.ArtifactStagingDirectory)
+          - task: PublishPipelineArtifact@1
+            displayName: Publish immutable image metadata
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: IMAGE_METADATA
+              publishLocation: pipeline
+
+  - stage: Deploy
+    displayName: Deploy digest to private AKS
+    dependsOn: Build
+    condition: succeeded()
+    variables:
+      imageReference: $[ stageDependencies.Build.Build.outputs['push.imageReference'] ]
+    jobs:
+      - job: Deploy
+        timeoutInMinutes: 20
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: none
+          - task: AzureCLI@2
+            displayName: Run kubectl in private AKS through ARM
+            inputs:
+              azureSubscription: fk-azure-oidc
+              scriptType: bash
+              scriptLocation: inlineScript
+              visibleAzLogin: false
+              inlineScript: |
+                set -euo pipefail
+                # Validate before embedding a digest reference in the remote shell.
+                [[ "$IMAGE_REFERENCE" =~ ^[a-z0-9]+\.azurecr\.io/foggykitchen-hello-world@sha256:[a-f0-9]{64}$ ]]
+                command="IMAGE_REFERENCE='$IMAGE_REFERENCE'
+                $(cat <<'REMOTE'
+                set -eu
+                kubectl create deployment fk-hello-world --image="$IMAGE_REFERENCE" --port=80 --dry-run=client -o yaml | kubectl apply -f -
+                kubectl set image deployment/fk-hello-world foggykitchen-hello-world="$IMAGE_REFERENCE"
+                kubectl expose deployment fk-hello-world --port=80 --target-port=80 --type=ClusterIP --dry-run=client -o yaml | kubectl apply -f -
+                kubectl rollout status deployment/fk-hello-world --timeout=300s
+                actual=$(kubectl get deployment fk-hello-world -o jsonpath='{.spec.template.spec.containers[0].image}')
+                test "$actual" = "$IMAGE_REFERENCE"
+                kubectl get pods -l app=fk-hello-world -o wide
+                kubectl get pods -l app=fk-hello-world -o jsonpath='{range .items[*]}{.metadata.name}{" image="}{.spec.containers[0].image}{" imageID="}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+                kubectl get service fk-hello-world
+                kubectl describe deployment fk-hello-world
+                REMOTE
+                )"
+                result=$(mktemp)
+                az aks command invoke --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" \
+                  --command "$command" --output json > "$result"
+                # The CLI exit code alone does not prove the remote command succeeded.
+                python3 - "$result" <<'PYTHON'
+                import json, sys
+                result = json.load(open(sys.argv[1]))
+                print(result.get("logs", ""))
+                if result.get("exitCode") != 0:
+                    raise SystemExit("AKS Run Command failed: " + json.dumps(result))
+                PYTHON
+            env:
+              RESOURCE_GROUP: $(resourceGroupName)
+              AKS_CLUSTER: $(aksClusterName)
+              IMAGE_REFERENCE: $(imageReference)
