@@ -6,6 +6,7 @@ It is intentionally small and predictable. Its main purpose is to serve as:
 
 - a Docker image source for OCI DevOps and Azure DevOps build pipelines
 - a container workload for Azure DevOps build-and-deploy examples using Azure Container Apps
+- a container workload for Azure DevOps build-and-deploy examples using private AKS and private ACR
 - a straightforward container workload for OKE deployment examples
 - a lightweight demo application for public FoggyKitchen patterns
 
@@ -52,6 +53,7 @@ foggykitchen-hello-world/
 ├── build_spec.yaml
 ├── azure-pipelines.yml
 ├── azure-pipelines-cicd.yml
+├── azure-pipelines-cicd-aks.yml
 └── README.md
 ```
 
@@ -129,6 +131,14 @@ This flow was verified end-to-end in the companion repository's example:
 
 That example registers `azure-pipelines-cicd.yml` from this repository's `master` branch; Terraform infrastructure and pipeline permissions belong in the companion repository.
 
+The included [azure-pipelines-cicd-aks.yml](azure-pipelines-cicd-aks.yml) builds and smoke-tests the image on a self-hosted Build agent, pushes it to private ACR, and deploys the exact image digest to private AKS. Deploy runs on a Microsoft-hosted `ubuntu-24.04` agent and executes kubectl through AKS Run Command (`az aks command invoke`), so the Deploy agent needs no direct kubectl network path to the private cluster. It checks rollout and the deployed image reference, and publishes digest and source metadata as `IMAGE_METADATA`.
+
+This flow was verified end-to-end in the companion orchestrator's example:
+
+- [foggykitchen-landing-zone-orchestrator: examples/azure/devops/build_and_deploy_aks/basic](https://github.com/foggykitchen/foggykitchen-landing-zone-orchestrator/tree/main/examples/azure/devops/build_and_deploy_aks/basic)
+
+Terraform infrastructure, agent provisioning and RBAC implementation belong in that companion repository.
+
 ---
 
 ## Azure Pipeline Notes
@@ -136,14 +146,20 @@ That example registers `azure-pipelines-cicd.yml` from this repository's `master
 The Azure DevOps YAML files:
 
 - use `trigger: none` and `pr: none` for manually queued reference runs; the CI/CD example avoids unexpected billable deployments
-- build on `ubuntu-24.04`, tag images with `Build.BuildId`, and compare the local HTTP response with `src/index.html`
+- use Microsoft-hosted `ubuntu-24.04` Build agents for the build-only and Container Apps flows; the private-AKS flow uses a self-hosted Build pool
+- tag images with `Build.BuildId` and compare the local HTTP response with `src/index.html`
 - publish a compressed image archive, source metadata and checksum in the build-only flow
 
-The CI/CD YAML additionally:
+The Container Apps CI/CD YAML additionally:
 
 - requires the `fk-configuration` variable group for registry, Resource Group, application, environment and HTTPS URL values
 - uses the `fk-azure-oidc` ARM service connection for OIDC-authenticated ACR push and Container Apps deployment
 - passes the tested image digest from Build to Deploy and verifies both the deployed image reference and HTTPS response content
+
+The private-AKS CI/CD YAML additionally:
+
+- selects the self-hosted Build pool through `$(buildAgentPool)` because pushing to ACR with public access disabled requires private registry connectivity; the companion example runs this agent on the jump VM inside the VNet
+- uses the companion orchestrator's cluster-scoped custom `<landing_zone.name> AKS Run Command` role, granting exactly `Microsoft.ContainerService/managedClusters/read`, `Microsoft.ContainerService/managedClusters/runcommand/action`, and `Microsoft.ContainerService/managedClusters/commandResults/read`. No built-in role worked in the live trials: both `Azure Kubernetes Service Cluster User Role` and `Azure Kubernetes Service RBAC Writer` failed. Role implementation and [live RBAC trial evidence](https://github.com/foggykitchen/foggykitchen-landing-zone-orchestrator/tree/main/examples/azure/devops/build_and_deploy_aks/basic#live-rbac-role-trials--2026-10-15) remain in the orchestrator repository.
 
 ---
 
